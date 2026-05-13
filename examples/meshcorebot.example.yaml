@@ -1,0 +1,72 @@
+# MeshcoreBot example configuration.
+# Run:
+#   meshcorebot examples/meshcorebot.example.yaml
+# Validate only:
+#   meshcorebot --check examples/meshcorebot.example.yaml
+
+transport:
+  type: serial                          # serial | ble
+  port: /dev/cu.usbmodemE8F60ACB19781   # for type=serial
+  baudrate: 115200
+  # for type=ble:
+  # type: ble
+  # address: null                       # null → connect to first MeshCore-* found
+  # pin: null                           # optional pairing PIN
+  # scan_timeout: 5s
+
+sinks:
+  console:
+    enabled: true
+    color: true
+
+  jsonl:
+    enabled: true
+    path: ./logs/meshcorebot-{date}.jsonl
+    # events: [trace_data, trace_timeout, chan_msg_sent, status]   # null → all
+
+  mqtt:
+    enabled: false                      # ← set true and fill in broker
+    broker: mqtt.example.local
+    port: 1883
+    username: null
+    password: null
+    topic_prefix: meshcore/probe1
+    qos: 0
+    retain: false
+
+bot:
+  device_name: probe-east
+  reconnect: true
+  reconnect_delay: 10s
+
+tasks:
+  # 1) Periodic channel messages — replaces the old meshcore-probe.py behaviour.
+  - name: connections-probe
+    type: chan_msg
+    enabled: true
+    interval: 5m
+    channel: "#connections"             # name or numeric index as string
+    messages:
+      - "p"
+      - "mt"
+    message_delay: 10s
+
+  # 2) The new feature — round-robin trace through a list of known routes.
+  - name: trace-known-routes
+    type: trace_loop
+    enabled: true
+    interval: 15m
+    mode: round_robin                   # round_robin | random
+    timeout: 5s
+    auth_code: 0
+    flags: 0
+    paths:
+      - name: to-ber-via-a-b
+        path: "e2,4a,e2"                # comma-separated hex path hashes
+        tag_field: ber-ab
+      - name: to-fra-via-c-d
+        path: "5f,3a,5f"
+        tag_field: fra-cd
+      - name: to-ams-2byte-hash
+        path: "a1b2,c3d4,a1b2"          # 2-byte prefixes also supported
+        tag_field: ams-cd

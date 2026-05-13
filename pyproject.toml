@@ -3,12 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "meshcore-cli"
-version = "1.5.7"
+name = "meshcorebot"
+version = "0.1.0"
 authors = [
-  { name="Florent de Lamotte", email="florent@frizoncorrea.fr" },
+  { name="MeshcoreBot contributors" },
 ]
-description = "Command line interface to meshcore companion radios and repeaters"
+description = "Declarative MeshCore bot — scheduled tasks (channel/contact messages, trace loops) over USB serial or BLE. Built as a fork of meshcore-cli."
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
@@ -17,15 +17,22 @@ classifiers = [
 ]
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
-dependencies = [ "meshcore >= 2.3.7",
-				 "bleak >= 0.22",
-				 "prompt_toolkit >= 3.0.50", 
-				 "requests >= 2.28.0" ]
-
-[project.urls]
-Homepage = "https://github.com/fdlamotte/meshcore-cli"
-Issues = "https://github.com/fdlamotte/meshcore-cli/issues"
+dependencies = [
+    "meshcore >= 2.3.7",
+    "bleak >= 0.22",
+    "prompt_toolkit >= 3.0.50",
+    "requests >= 2.28.0",
+    "pyyaml >= 6.0",
+    "pydantic >= 2.5",
+    "paho-mqtt >= 2.0",
+]
 
 [project.scripts]
+# New: declarative bot
+meshcorebot = "meshcorebot.__main__:cli"
+# Legacy: original interactive REPL — preserved for debugging
 meshcli = "meshcore_cli.meshcore_cli:cli"
 meshcore-cli = "meshcore_cli.meshcore_cli:cli"
+
+[project.urls]
+"Forked-From" = "https://github.com/meshcore-dev/meshcore-cli"
