@@ -22,7 +22,15 @@ def _color_for(event: str) -> str:
         return _GREEN
     if event == "status":
         return _CYAN
+    if event.endswith("_summary"):
+        return _CYAN
     return _YELLOW
+
+
+# Fields rendered specially / suppressed from the inline body.
+# `text` → printed as an indented multi-line block below the header.
+# `rows` → structured data for jsonl/mqtt; too verbose for console.
+_INLINE_SUPPRESS = {"text", "rows"}
 
 
 class ConsoleSinkImpl(Sink):
@@ -33,8 +41,11 @@ class ConsoleSinkImpl(Sink):
 
     async def write(self, record: Record) -> None:
         ts = record.ts.split("T", 1)[1].rstrip("Z+0:")[:8]  # HH:MM:SS
+        text_block = record.data.get("text")
+        body = " ".join(
+            f"{k}={v!r}" for k, v in record.data.items() if k not in _INLINE_SUPPRESS
+        )
         head = f"[{ts}] {record.task} {record.event}"
-        body = " ".join(f"{k}={v!r}" for k, v in record.data.items())
         if self._color:
             c = _color_for(record.event)
             line = f"{_DIM}[{ts}]{_RESET} {_CYAN}{record.task}{_RESET} {c}{record.event}{_RESET}"
@@ -43,3 +54,6 @@ class ConsoleSinkImpl(Sink):
         else:
             line = head + (f" {body}" if body else "")
         print(line, flush=True)
+        if isinstance(text_block, str) and text_block:
+            for ln in text_block.splitlines():
+                print(f"  {ln}", flush=True)

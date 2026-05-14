@@ -4,33 +4,85 @@
 # Validate only:
 #   meshcorebot --check examples/meshcorebot.example.yaml
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# EDITABLE KNOBS — change these, leave the rest alone.
+#
+# Top-level keys starting with `_` are scratch space for YAML anchors; load_config
+# strips them before validation. Tasks below pull these via merge keys (<<: *…).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Which tasks to actually run this session. Flip true ↔ false; disabled tasks
+# stay defined but are skipped by the scheduler.
+_run:
+  connections_probe: &run_probe   false
+  traces_from_3333:  &run_3333    true
+  traces_from_3434:  &run_3434    false
+
+# Common defaults for every trace_matrix task. Override per-task as needed.
+_trace_defaults: &trace_defaults
+  type: trace_matrix
+  cycles: 0                    # 0 = run until Ctrl-C; or N for N cycles then exit
+  cycle_interval: 1m          # between cycle starts (`5m`, `30s`, `1h`, or seconds)
+  trace_delay: 10s             # gap between consecutive traces inside one cycle
+  timeout: 8s                  # per-trace wait for TRACE_DATA before counting timeout
+  auth_code: 0
+  # flags: null              # null → auto-detect path-hash width from hex segment.
+                              # Override only if you need a non-standard mode (0=1B, 1=2B, 2=4B, 3=8B).
+
+# Known OTHER repeaters (full list — extend as you discover more).
+# Each task references a subset via `others: *anchor_name`.
+_others_pool:
+  full: &others_full
+    - "5A94"
+    - "4A2C"
+    - "3A2A"
+    - "FFFF"
+    - "5798"
+    - "1488"
+  via_3333: &others_3333       # subset reachable / interesting from 3333
+    - "5A94"
+    - "4A2C"
+    - "3A2A"
+  via_3434: &others_3434       # subset reachable / interesting from 3434
+    - "5A94"
+    - "4A2C"
+    - "3A2A"
+    - "FFFF"
+    - "5798"
+    - "1488"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Transport / sinks / bot — set once, rarely touched.
+# ═══════════════════════════════════════════════════════════════════════════════
+
 transport:
-  type: serial                          # serial | ble
-  port: /dev/cu.usbmodemE8F60ACB19781   # for type=serial
-  baudrate: 115200
-  # for type=ble:
-  # type: ble
-  # address: null                       # null → connect to first MeshCore-* found
-  # pin: null                           # optional pairing PIN
-  # scan_timeout: 5s
+  # Heltec T114 companion firmware is typically BLE-only: USB CDC works for
+  # flashing/debug print but doesn't speak the companion API. Use BLE here.
+  type: ble                             # serial | ble
+  address: null                         # null → connects to the first MeshCore-* in range
+  pin: null                             # set if your companion requires pairing PIN
+  scan_timeout: 15s
+
+  # --- USB serial alternative (uncomment if you have a USB-capable companion) ---
+  # type: serial
+  # port: /dev/cu.usbmodem1101          # `ls /dev/cu.usbmodem*` after plug-in
+  # baudrate: 115200
 
 sinks:
   console:
     enabled: true
     color: true
-
   jsonl:
     enabled: true
     path: ./logs/meshcorebot-{date}.jsonl
     # events: [trace_data, trace_timeout, chan_msg_sent, status]   # null → all
-
   mqtt:
-    enabled: false                      # ← set true and fill in broker
-    broker: mqtt.example.local
-    port: 1883
-    username: null
-    password: null
-    topic_prefix: meshcore/probe1
+    enabled: true
+    broker: 192.168.8.121               # local Mosquitto on LAN
+    port: 1883                          # plain TCP, no TLS
+    username: meshcore
+    password: meshcore
+    topic_prefix: meshcore/probe1       # publishes as <prefix>/<event>
     qos: 0
     retain: false
 
@@ -39,11 +91,27 @@ bot:
   reconnect: true
   reconnect_delay: 10s
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tasks — only the parts that differ per-task. Shared knobs come from `_trace_defaults` above.
+#
+# Both trace_matrix tasks below run concurrently (independent asyncio coroutines,
+# correlated by per-trace tag). On the same companion node they share the radio,
+# which serializes transmissions but doesn't conflict logically.
+#
+# Output per cycle:
+#   - per-trace:  `trace_sent` → `trace_data` (SNRs along path) | `trace_timeout`
+#   - end of cycle: `trace_cycle_summary` with cumulative table
+#       Test       SNR→    SNR←    Trace
+#       5A94       8.55   10.80    15/21
+# Ctrl-C: same table printed to stderr; structured records go to jsonl/mqtt
+# for every cycle except the post-cancel one (sinks are shutting down).
+# ═══════════════════════════════════════════════════════════════════════════════
+
 tasks:
-  # 1) Periodic channel messages — replaces the old meshcore-probe.py behaviour.
+  # Periodic channel messages — replaces the old meshcore-probe.py behaviour.
   - name: connections-probe
     type: chan_msg
-    enabled: true
+    enabled: *run_probe
     interval: 5m
     channel: "#connections"             # name or numeric index as string
     messages:
@@ -51,22 +119,27 @@ tasks:
       - "mt"
     message_delay: 10s
 
-  # 2) The new feature — round-robin trace through a list of known routes.
-  - name: trace-known-routes
-    type: trace_loop
-    enabled: true
-    interval: 15m
-    mode: round_robin                   # round_robin | random
-    timeout: 5s
-    auth_code: 0
-    flags: 0
-    paths:
-      - name: to-ber-via-a-b
-        path: "e2,4a,e2"                # comma-separated hex path hashes
-        tag_field: ber-ab
-      - name: to-fra-via-c-d
-        path: "5f,3a,5f"
-        tag_field: fra-cd
-      - name: to-ams-2byte-hash
-        path: "a1b2,c3d4,a1b2"          # 2-byte prefixes also supported
-        tag_field: ams-cd
+  # Trace matrix from MY=3333 repeater.
+  - <<: *trace_defaults
+    name: traces-from-3333
+    enabled: *run_3333
+    my_repeater: "3333"
+    others: *others_3333
+
+  # Trace matrix from MY=3434 (also Observer).
+  - <<: *trace_defaults
+    name: traces-from-3434
+    enabled: *run_3434
+    my_repeater: "3434"
+    others: *others_3434
+
+  # --- legacy round-robin trace task (kept for reference / simpler use cases) ---
+  # - name: trace-known-routes
+  #   type: trace_loop
+  #   enabled: false
+  #   interval: 15m
+  #   mode: round_robin
+  #   timeout: 5s
+  #   paths:
+  #     - {name: rpt-33, path: "33", tag_field: rpt-33}
+  #     - {name: rpt-34, path: "34", tag_field: rpt-34}

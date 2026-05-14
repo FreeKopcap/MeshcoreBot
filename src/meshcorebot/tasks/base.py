@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from ..config import ChannelMessage, Task, TraceLoop
+from ..config import ChannelMessage, Task, TraceLoop, TraceMatrix
 
 if TYPE_CHECKING:
     from meshcore import MeshCore
@@ -38,11 +38,14 @@ def build_task(cfg: Task, device_name: str, sinks: "Fanout") -> BaseTask:
     """Map a config task variant to its implementation."""
     from .chan_msg import ChanMsgTask
     from .trace_loop import TraceLoopTask
+    from .trace_matrix import TraceMatrixTask
 
     if isinstance(cfg, ChannelMessage):
         return ChanMsgTask(cfg, device_name, sinks)
     if isinstance(cfg, TraceLoop):
         return TraceLoopTask(cfg, device_name, sinks)
+    if isinstance(cfg, TraceMatrix):
+        return TraceMatrixTask(cfg, device_name, sinks)
     raise TypeError(f"unknown task type: {type(cfg).__name__}")
 
 

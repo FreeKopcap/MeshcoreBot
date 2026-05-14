@@ -68,21 +68,22 @@ class TraceLoopTask(BaseTask):
         while True:
             cycle += 1
             route = next(it)
-            send = await mc.commands.send_trace(
-                auth_code=self.cfg.auth_code,
-                flags=self.cfg.flags,
-                path=route.path,
-            )
+            # See trace_matrix._do_one_trace: lib generates a tag if not given
+            # but doesn't echo it back, so we own the tag ourselves.
+            tag = random.randint(1, 0xFFFFFFFF)
+            send_kwargs = {"auth_code": self.cfg.auth_code, "tag": tag, "path": route.path}
+            if self.cfg.flags is not None:
+                send_kwargs["flags"] = self.cfg.flags
+            send = await mc.commands.send_trace(**send_kwargs)
             if send.type == EventType.ERROR:
                 await self.emit(
                     "trace_send_error", cycle=cycle, route=route.name,
-                    path=route.path, error=str(send.payload),
+                    path=route.path, tag=tag, error=str(send.payload),
                 )
                 await safe_sleep(self.cfg.interval)
                 continue
 
-            tag = send.payload.get("tag")
-            est_timeout_ms = send.payload.get("est_timeout", 0)
+            est_timeout_ms = send.payload.get("est_timeout", 0) if isinstance(send.payload, dict) else 0
             await self.emit(
                 "trace_sent", cycle=cycle, route=route.name, path=route.path,
                 tag=tag, est_timeout_ms=est_timeout_ms,

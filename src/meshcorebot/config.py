@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Union
 
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 
 # -- Duration -----------------------------------------------------------------
@@ -153,7 +153,9 @@ class TraceLoop(BaseModel):
     mode: Literal["round_robin", "random"] = "round_robin"
     timeout: Duration = 5.0
     auth_code: int = 0
-    flags: int = 0
+    # flags encodes path-hash byte width: 0→1B, 1→2B, 2→4B, 3→8B (bits 0-1).
+    # When None, meshcore lib infers it from the first hex segment of `path`.
+    flags: int | None = None
     paths: list[TracePath]
 
     @field_validator("paths")
@@ -164,8 +166,91 @@ class TraceLoop(BaseModel):
         return v
 
 
+_HEX_RE = re.compile(r"[0-9a-f]+")
+
+
+class TraceMatrix(BaseModel):
+    """Cycle-based trace probing through MY repeater to a list of OTHER repeaters.
+
+    Each cycle does one ``send_trace`` per OTHER (``MY,OTHER,MY``-shaped path),
+    waits ``trace_delay`` between them, then prints a cumulative summary table:
+    SNR→ (OTHER heard MY going out), SNR← (MY heard OTHER on the return),
+    success/attempts. Multi-hop paths (``MY,O1,O2,MY``) are accepted at the
+    protocol level — the table just shows endpoint SNRs; richer per-hop
+    columns are deferred to a future revision.
+
+    The MY-end token width follows OTHER's hex width: OTHER ``"5A94"`` ⇒
+    MY end ``my_repeater[:4]``; OTHER ``"5A"`` ⇒ MY end ``my_repeater[:2]``.
+    Hence ``my_repeater`` must be at least as long as the longest OTHER.
+    """
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["trace_matrix"]
+    name: str
+    enabled: bool = True
+
+    # --- editable parameters (top of YAML for visibility) ---
+    cycles: int = 0                       # 0 = run forever until Ctrl-C
+    cycle_interval: Duration              # seconds between cycle starts
+    trace_delay: Duration = 5.0           # seconds between traces within one cycle
+    my_repeater: str                      # hex prefix of MY repeater, e.g. "3333" or "333333"
+    others: list[str]                     # OTHER repeaters to probe (each one trace per cycle)
+
+    # --- trace knobs ---
+    timeout: Duration = 8.0
+    auth_code: int = 0
+    # flags encodes path-hash byte width: 0→1B, 1→2B, 2→4B, 3→8B (bits 0-1).
+    # When None, meshcore lib infers it from the first hex segment of the path.
+    flags: int | None = None
+
+    @field_validator("cycles")
+    @classmethod
+    def _check_cycles(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("cycles must be >= 0 (0 = run until Ctrl-C)")
+        return v
+
+    @field_validator("my_repeater")
+    @classmethod
+    def _check_my(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not _HEX_RE.fullmatch(v):
+            raise ValueError(f"my_repeater {v!r} is not hex")
+        if len(v) == 0 or len(v) % 2 != 0:
+            raise ValueError(f"my_repeater {v!r} must have even hex length (whole bytes)")
+        return v
+
+    @field_validator("others")
+    @classmethod
+    def _check_others(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("others must contain at least one entry")
+        out: list[str] = []
+        seen: set[str] = set()
+        for o in v:
+            n = o.strip().lower()
+            if not _HEX_RE.fullmatch(n):
+                raise ValueError(f"other {o!r} is not hex")
+            if len(n) == 0 or len(n) % 2 != 0:
+                raise ValueError(f"other {o!r} must have even hex length (whole bytes)")
+            if n in seen:
+                raise ValueError(f"duplicate other {o!r}")
+            seen.add(n)
+            out.append(n)
+        return out
+
+    @model_validator(mode="after")
+    def _my_long_enough(self) -> "TraceMatrix":
+        max_other = max(len(o) for o in self.others)
+        if len(self.my_repeater) < max_other:
+            raise ValueError(
+                f"my_repeater {self.my_repeater!r} (len {len(self.my_repeater)}) "
+                f"shorter than longest other (len {max_other}); MY-end width follows OTHER"
+            )
+        return self
+
+
 Task = Annotated[
-    Union[ChannelMessage, TraceLoop],
+    Union[ChannelMessage, TraceLoop, TraceMatrix],
     Field(discriminator="type"),
 ]
 
@@ -181,10 +266,19 @@ class Config(BaseModel):
 
 
 def load_config(path: str | Path) -> Config:
-    """Load and validate a YAML config file."""
+    """Load and validate a YAML config file.
+
+    Top-level keys starting with ``_`` are stripped before validation — that
+    gives you free scratch space for YAML anchors (``_repeaters_pool: &pool …``)
+    that pydantic's ``extra="forbid"`` would otherwise reject.
+    """
     p = Path(path)
     with p.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     if raw is None:
         raise ValueError(f"{p}: empty config")
+    if isinstance(raw, dict):
+        for k in list(raw.keys()):
+            if isinstance(k, str) and k.startswith("_"):
+                raw.pop(k)
     return Config.model_validate(raw)
