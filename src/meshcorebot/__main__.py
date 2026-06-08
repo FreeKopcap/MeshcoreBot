@@ -51,13 +51,19 @@ def cli() -> None:
     from .scheduler import supervise
 
     async def _runner() -> None:
+        # SIGINT: leave it to Python's default — that surfaces as KeyboardInterrupt
+        # which asyncio.run catches and translates into a task-cancel with a
+        # short grace period. Doing our own loop.add_signal_handler(SIGINT, ...)
+        # conflicts with prompt_toolkit (it manipulates SIGINT around its
+        # async prompts, and sometimes leaves us without a working handler).
+        # SIGTERM we still install — for systemd/CI use cases where SIGTERM is
+        # the canonical shutdown signal and Python's default would just exit.
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except NotImplementedError:  # windows
-                pass
+        try:
+            loop.add_signal_handler(signal.SIGTERM, stop.set)
+        except NotImplementedError:  # windows
+            pass
 
         run_task = asyncio.create_task(supervise(cfg), name="meshcorebot.supervise")
         stop_task = asyncio.create_task(stop.wait(), name="meshcorebot.stop")

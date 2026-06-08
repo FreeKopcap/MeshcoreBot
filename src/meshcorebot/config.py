@@ -52,7 +52,14 @@ class SerialTransport(BaseModel):
 class BleTransport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     type: Literal["ble"]
-    address: str | None = None  # MAC / UUID, or None → first MeshCore-* device
+    # Exact BLE address (MAC with ":" on Linux/Win, UUID on macOS). When set, used
+    # directly with no scan. Set this OR `name`, not both.
+    address: str | None = None
+    # Substring match (case-insensitive) against the device's local_name. Useful
+    # when several MeshCore-* nodes are in range. Example: "Kopcap V4".
+    # When None AND multiple MeshCore-* found, the bot will scan and prompt
+    # interactively (if stdin is a TTY) or use the first match (if not).
+    name: str | None = None
     pin: int | None = None
     scan_timeout: Duration = 5.0
 

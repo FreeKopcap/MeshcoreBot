@@ -18,6 +18,42 @@ _run:
   traces_from_3333:  &run_3333    true
   traces_from_3434:  &run_3434    false
 
+# Which output sinks to enable. console = stdout, jsonl = ./logs/*.jsonl, mqtt = broker.
+_sinks_on:
+  console: &sink_console  true
+  jsonl:   &sink_jsonl    false
+  mqtt:    &sink_mqtt     false
+
+# How to connect to the companion node. Two prebuilt blocks below; the active one
+# is referenced in `transport:` further down via *transport_ble / *transport_serial.
+# Edit only the one you actually use; flip the alias in `transport:` to switch.
+# BLE devices seen during a 12s scan (2026-05-14). Use one of these aliases
+# at `_transport_options.ble.name` below to pick which companion to connect to.
+# Substring match against advertised local_name (case-insensitive).
+_ble_devices:
+  any:         &ble_any         null               # null → scan + interactive prompt (or first match if non-TTY)
+  kopcap_v4:   &ble_kopcap_v4   "Kopcap V4"        # MeshCore-Kopcap V4️⃣        CBC62442-22C1-…  RSSI ≈ -62
+  kopcap_echo: &ble_kopcap_echo "Kopcap Echo"      # MeshCore-Kopcap Echo 🔁     1C3DFD1B-EFEF-…  RSSI ≈ -48
+  kopcap_114:  &ble_kopcap_114  "Kopcap 1"         # Meshcore-Kopcap 1️⃣1️⃣4️⃣  096BFFF3-2179-…  RSSI ≈ -70 (T114)
+
+_transport_options:
+  ble: &transport_ble
+    type: ble
+    # Pick a device — three ways, in priority order:
+    #   address: "AA:BB:..."  exact MAC/UUID, skips scan entirely
+    #   name:    *ble_<one>   substring of advertised name (see _ble_devices above)
+    #   both null            scan + interactive prompt (or first match if non-TTY)
+    address: null
+    name: *ble_kopcap_114               # ← flip alias to switch device
+#    name: *ble_kopcap_v4               # ← flip alias to switch device
+#    name: *ble_any               # ← flip alias to switch device
+    pin: null                          # set int if companion requires pairing PIN
+    scan_timeout: 15s
+  serial: &transport_serial
+    type: serial
+    port: /dev/cu.usbmodem1101         # `ls /dev/cu.usbmodem*` after plug-in
+    baudrate: 115200
+
 # Common defaults for every trace_matrix task. Override per-task as needed.
 _trace_defaults: &trace_defaults
   type: trace_matrix
@@ -29,8 +65,12 @@ _trace_defaults: &trace_defaults
   # flags: null              # null → auto-detect path-hash width from hex segment.
                               # Override only if you need a non-standard mode (0=1B, 1=2B, 2=4B, 3=8B).
 
-# Known OTHER repeaters (full list — extend as you discover more).
-# Each task references a subset via `others: *anchor_name`.
+# Pre-defined OTHER-repeater lists. Each task picks one via `others: *<anchor>`
+# in the tasks section below. Available choices:
+#   *others_full                — all known repeaters
+#   *others_good                — your hand-picked reliable subset (edit to taste)
+#   *only_5A94 / *only_4A2C / *only_3A2A / *only_FFFF / *only_5798 / *only_1488
+#                               — single-OTHER lists for targeted probing
 _others_pool:
   full: &others_full
     - "5A94"
@@ -39,45 +79,47 @@ _others_pool:
     - "FFFF"
     - "5798"
     - "1488"
-  via_3333: &others_3333       # subset reachable / interesting from 3333
+  good: &others_good           # ← edit to your "reliable" subset (today: same as full)
     - "5A94"
     - "4A2C"
     - "3A2A"
-  via_3434: &others_3434       # subset reachable / interesting from 3434
-    - "5A94"
-    - "4A2C"
-    - "3A2A"
-    - "FFFF"
-    - "5798"
-    - "1488"
+  # Single-OTHER focused lists. Useful when one neighbour misbehaves and you
+  # want concentrated stats without others diluting the timing.
+  only_5A94: &only_5A94 ["5A94"]
+  only_4A2C: &only_4A2C ["4A2C"]
+  only_3A2A: &only_3A2A ["3A2A"]
+  only_FFFF: &only_FFFF ["FFFF"]
+  only_5798: &only_5798 ["5798"]
+  only_1488: &only_1488 ["1488"]
+
+# Per-task OTHER-list selector. Tasks reference these via merge keys, so
+# THIS is the one place to edit when you want a different list for a task —
+# the task bodies below stay untouched.
+_for_3333: &for_3333
+  others: *others_good               # *others_full | *others_good | *only_<HEX>
+
+_for_3434: &for_3434
+  others: *others_full               # *others_full | *others_good | *only_<HEX>
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Transport / sinks / bot — set once, rarely touched.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-transport:
-  # Heltec T114 companion firmware is typically BLE-only: USB CDC works for
-  # flashing/debug print but doesn't speak the companion API. Use BLE here.
-  type: ble                             # serial | ble
-  address: null                         # null → connects to the first MeshCore-* in range
-  pin: null                             # set if your companion requires pairing PIN
-  scan_timeout: 15s
-
-  # --- USB serial alternative (uncomment if you have a USB-capable companion) ---
-  # type: serial
-  # port: /dev/cu.usbmodem1101          # `ls /dev/cu.usbmodem*` after plug-in
-  # baudrate: 115200
+# Active transport — flip the alias here.
+# Heltec T114 companion firmware is BLE-only (USB CDC enumerates but doesn't speak
+# companion API); use *transport_ble. *transport_serial works on USB-capable companions.
+transport: *transport_ble                # *transport_ble  |  *transport_serial
 
 sinks:
   console:
-    enabled: true
+    enabled: *sink_console
     color: true
   jsonl:
-    enabled: true
+    enabled: *sink_jsonl
     path: ./logs/meshcorebot-{date}.jsonl
     # events: [trace_data, trace_timeout, chan_msg_sent, status]   # null → all
   mqtt:
-    enabled: true
+    enabled: *sink_mqtt
     broker: 192.168.8.121               # local Mosquitto on LAN
     port: 1883                          # plain TCP, no TLS
     username: meshcore
@@ -119,19 +161,18 @@ tasks:
       - "mt"
     message_delay: 10s
 
-  # Trace matrix from MY=3333 repeater.
-  - <<: *trace_defaults
+  # Trace matrix from MY=3333 (Observer node — feeds Meshcore Analyzer via MQTT).
+  # `others:` is set by `_for_3333` at top — don't change here.
+  - <<: [*trace_defaults, *for_3333]
     name: traces-from-3333
     enabled: *run_3333
     my_repeater: "3333"
-    others: *others_3333
 
-  # Trace matrix from MY=3434 (also Observer).
-  - <<: *trace_defaults
+  # Trace matrix from MY=3434 (plain repeater). `others:` set by `_for_3434` at top.
+  - <<: [*trace_defaults, *for_3434]
     name: traces-from-3434
     enabled: *run_3434
     my_repeater: "3434"
-    others: *others_3434
 
   # --- legacy round-robin trace task (kept for reference / simpler use cases) ---
   # - name: trace-known-routes
