@@ -19,13 +19,17 @@ import asyncio
 import logging
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from typing import TYPE_CHECKING
 
 from meshcore import EventType
 
 from ..config import TraceMatrix
 from .base import BaseTask, safe_sleep
 from .trace_loop import _flatten_trace_payload
+
+if TYPE_CHECKING:
+    from ..stats_store import StatsStore
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +88,39 @@ def _format_table(task_name: str, cycle: int, final: bool, others: list[str],
     return "\n".join(lines), rows
 
 
+def _config_fingerprint(cfg: TraceMatrix) -> str:
+    """Stable identifier for what this task probes. Used by StatsStore to
+    auto-invalidate an on-disk file when ``my_repeater`` or ``others`` change."""
+    return f"my={cfg.my_repeater};others={','.join(sorted(cfg.others))}"
+
+
 class TraceMatrixTask(BaseTask):
     cfg: TraceMatrix
 
-    def __init__(self, cfg, device_name, sinks) -> None:
+    def __init__(self, cfg, device_name, sinks, stats_store: "StatsStore | None" = None) -> None:
         super().__init__(cfg, device_name, sinks)
+        self._stats_store = stats_store
         self._stats: dict[str, _Stats] = {o: _Stats() for o in cfg.others}
         self._cycle: int = 0
+        # Hydrate from persistent store if given. Empty if no prior file or
+        # if config fingerprint changed (store handles that itself).
+        if stats_store is not None:
+            stored = stats_store.load(self.name, _config_fingerprint(cfg))
+            self._cycle = stored.cycle
+            _stats_field_names = {f.name for f in fields(_Stats)}
+            for other in cfg.others:
+                raw = stored.per_other.get(other)
+                if not raw:
+                    continue
+                # Defensive: only accept known fields, in case file is from
+                # a slightly older format with extra/missing keys.
+                clean = {k: v for k, v in raw.items() if k in _stats_field_names}
+                self._stats[other] = _Stats(**clean)
+            logger.info(
+                "trace_matrix %r resumed from store: cycle=%d, %d OTHER(s) restored",
+                self.name, self._cycle,
+                sum(1 for o in cfg.others if stored.per_other.get(o)),
+            )
 
     def _build_path(self, other: str) -> str:
         width = len(other)
@@ -209,7 +239,19 @@ class TraceMatrixTask(BaseTask):
             hops=hops_flat, **flat,
         )
 
+    def _persist_stats(self) -> None:
+        """Sync in-memory _stats + _cycle into the store and write to disk."""
+        if self._stats_store is None:
+            return
+        # Re-use the cached TaskStats object (load() returns the same instance
+        # we mutate). Make sure its fields are current.
+        stored = self._stats_store.load(self.name, _config_fingerprint(self.cfg))
+        stored.cycle = self._cycle
+        stored.per_other = {o: asdict(s) for o, s in self._stats.items()}
+        self._stats_store.save(self.name)
+
     async def _emit_summary(self, cycle: int, final: bool) -> None:
+        self._persist_stats()
         text, rows = _format_table(self.name, cycle, final,
                                    list(self.cfg.others), self._stats)
         await self.emit(

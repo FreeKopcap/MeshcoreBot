@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from meshcore import MeshCore
 
     from ..sinks.base import Fanout
+    from ..stats_store import StatsStore
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,16 @@ class BaseTask:
         await self.sinks.write(Record(event=event, task=self.name, device=self.device, data=data))
 
 
-def build_task(cfg: Task, device_name: str, sinks: "Fanout") -> BaseTask:
-    """Map a config task variant to its implementation."""
+def build_task(
+    cfg: Task,
+    device_name: str,
+    sinks: "Fanout",
+    stats_store: "StatsStore | None" = None,
+) -> BaseTask:
+    """Map a config task variant to its implementation.
+
+    ``stats_store`` is only consumed by ``trace_matrix``; other task types ignore it.
+    """
     from .chan_msg import ChanMsgTask
     from .trace_loop import TraceLoopTask
     from .trace_matrix import TraceMatrixTask
@@ -45,7 +54,7 @@ def build_task(cfg: Task, device_name: str, sinks: "Fanout") -> BaseTask:
     if isinstance(cfg, TraceLoop):
         return TraceLoopTask(cfg, device_name, sinks)
     if isinstance(cfg, TraceMatrix):
-        return TraceMatrixTask(cfg, device_name, sinks)
+        return TraceMatrixTask(cfg, device_name, sinks, stats_store=stats_store)
     raise TypeError(f"unknown task type: {type(cfg).__name__}")
 
 

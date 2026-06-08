@@ -18,6 +18,7 @@ from meshcore import EventType
 
 from .config import Config
 from .sinks.base import Fanout, Record
+from .stats_store import StatsStore
 from .tasks.base import BaseTask, build_task
 from .transport import connect, disconnect
 
@@ -38,9 +39,17 @@ async def _run_one(task: BaseTask, mc, sinks: Fanout) -> None:
         ))
 
 
-async def supervise(cfg: Config) -> None:
-    """Main bot loop. Returns on KeyboardInterrupt/cancellation."""
+async def supervise(cfg: Config, stats_store: StatsStore | None = None) -> None:
+    """Main bot loop. Returns on KeyboardInterrupt/cancellation.
+
+    ``stats_store`` is shared across reconnects so trace_matrix tasks resume
+    their cumulative counters instead of restarting at zero on every BLE
+    re-link. The store is created once by the caller (``__main__.cli``), so
+    its in-memory cache + disk-backed JSON files persist across the whole
+    run; a single fingerprint-mismatch auto-invalidates a stale file."""
     sinks = __import__("meshcorebot.sinks", fromlist=["build_sinks"]).build_sinks(cfg.sinks)
+    if stats_store is None:
+        stats_store = StatsStore()
     await sinks.start()
     try:
         while True:
@@ -71,7 +80,8 @@ async def supervise(cfg: Config) -> None:
                 for t in cfg.tasks:
                     if not getattr(t, "enabled", True):
                         continue
-                    impls.append(build_task(t, cfg.bot.device_name, sinks))
+                    impls.append(build_task(t, cfg.bot.device_name, sinks,
+                                            stats_store=stats_store))
 
                 if not impls:
                     await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
