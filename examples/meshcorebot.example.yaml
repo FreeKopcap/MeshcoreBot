@@ -60,7 +60,7 @@ _trace_defaults: &trace_defaults
   cycles: 0                    # 0 = run until Ctrl-C; or N for N cycles then exit
   cycle_interval: 1m          # between cycle starts (`5m`, `30s`, `1h`, or seconds)
   trace_delay: 10s             # gap between consecutive traces inside one cycle
-  timeout: 8s                  # per-trace wait for TRACE_DATA before counting timeout
+  timeout: 5s                  # per-trace wait for TRACE_DATA before counting timeout
   auth_code: 0
   # flags: null              # null → auto-detect path-hash width from hex segment.
                               # Override only if you need a non-standard mode (0=1B, 1=2B, 2=4B, 3=8B).
@@ -91,6 +91,8 @@ _others_pool:
   only_FFFF: &only_FFFF ["FFFF"]
   only_5798: &only_5798 ["5798"]
   only_1488: &only_1488 ["1488"]
+  only_DB6B: &only_DB6B ["DB6B"]
+  only_ABCD: &only_ABCD ["ABCD"]
 
 # Per-task OTHER-list selector. Tasks reference these via merge keys, so
 # THIS is the one place to edit when you want a different list for a task —
@@ -132,6 +134,12 @@ bot:
   device_name: probe-east
   reconnect: true
   reconnect_delay: 10s
+  # Global throttle: minimum gap between any two send_trace BLE-events across
+  # ALL trace_matrix tasks (within-task pacing still comes from `trace_delay`).
+  # Default 2s — quiet enough that the repeater can finish relaying one packet
+  # before the next arrives. Set to null or 0 to disable; bump higher if you
+  # want more headroom.
+  # cross_task_delay: 2s
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tasks — only the parts that differ per-task. Shared knobs come from `_trace_defaults` above.

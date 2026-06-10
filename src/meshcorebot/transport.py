@@ -170,6 +170,10 @@ async def disconnect(mc: Optional[MeshCore]) -> None:
     if mc is None:
         return
     try:
-        await mc.disconnect()
+        # macOS BLE stack can hang on stop_notify / characteristic-disconnect
+        # during shutdown; cap it so Ctrl-C reliably exits the process.
+        await asyncio.wait_for(mc.disconnect(), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning("mc.disconnect timed out after 3s; proceeding with shutdown")
     except Exception as e:  # noqa: BLE001 — best-effort cleanup
         logger.warning("disconnect raised: %s", e)

@@ -30,6 +30,7 @@ from .trace_loop import _flatten_trace_payload
 
 if TYPE_CHECKING:
     from ..stats_store import StatsStore
+    from ..tx_throttle import TxThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +66,14 @@ def _format_table(task_name: str, cycle: int, final: bool, others: list[str],
 
     Returns (text_block, structured_rows). Rows are also returned for JSONL/MQTT.
     """
-    title = f"{task_name} — cycle {cycle}" + (" (FINAL)" if final else " (cumulative)")
     header = f"{'Test':<10} {'SNR→':>7} {'SNR←':>7} {'Trace':>9}"
-    sep = "-" * len(header)
-    lines = [title, header, sep]
+    width = len(header)
+    sep_outer = "=" * width
+    sep_inner = "-" * width
+    # No title here — the console sink renders a compact "[ts] task (cycle N)"
+    # header line for trace_cycle_summary; jsonl/mqtt have cycle+final fields
+    # in the structured payload.
+    lines = [sep_outer, header, sep_inner]
     rows: list[dict] = []
     for o in others:
         s = stats[o]
@@ -97,11 +102,47 @@ def _config_fingerprint(cfg: TraceMatrix) -> str:
 class TraceMatrixTask(BaseTask):
     cfg: TraceMatrix
 
-    def __init__(self, cfg, device_name, sinks, stats_store: "StatsStore | None" = None) -> None:
+    def __init__(self, cfg, device_name, sinks, stats_store: "StatsStore | None" = None,
+                 tx_throttle: "TxThrottle | None" = None,
+                 cycle_barrier: "asyncio.Barrier | None" = None) -> None:
         super().__init__(cfg, device_name, sinks)
         self._stats_store = stats_store
+        self._tx_throttle = tx_throttle
+        # When multiple trace_matrix tasks run together, this Barrier syncs
+        # them at end-of-cycle so their summaries print back-to-back instead
+        # of being interleaved with the slower task's last-trace events.
+        self._cycle_barrier = cycle_barrier
         self._stats: dict[str, _Stats] = {o: _Stats() for o in cfg.others}
         self._cycle: int = 0
+
+        # Effective timings — bumped if user's values would cause overlap.
+        # trace_delay is now measured send-to-send (not response-to-send), so
+        # to avoid the next send firing before the previous one's response
+        # window + throttle gate is done, we need:
+        #   trace_delay >= timeout + cross_task_delay
+        # Similarly cycle_interval (start-to-start) must fit a whole cycle of
+        # N OTHERs at the trace_delay cadence:
+        #   cycle_interval >= len(others) * trace_delay
+        gate = tx_throttle.min_gap if tx_throttle is not None else 0.0
+        min_td = float(cfg.timeout) + gate
+        self._effective_trace_delay = max(float(cfg.trace_delay), min_td)
+        if self._effective_trace_delay > float(cfg.trace_delay):
+            logger.info(
+                "trace_matrix %r: bumping trace_delay %.1fs → %.1fs "
+                "(timeout %.1fs + cross_task_delay %.1fs) so send-to-send "
+                "cadence stays regular",
+                self.name, cfg.trace_delay, self._effective_trace_delay,
+                cfg.timeout, gate,
+            )
+        min_ci = len(cfg.others) * self._effective_trace_delay
+        self._effective_cycle_interval = max(float(cfg.cycle_interval), min_ci)
+        if self._effective_cycle_interval > float(cfg.cycle_interval):
+            logger.info(
+                "trace_matrix %r: bumping cycle_interval %.1fs → %.1fs "
+                "(%d OTHERs × %.1fs trace_delay) so cycle-to-cycle cadence stays regular",
+                self.name, cfg.cycle_interval, self._effective_cycle_interval,
+                len(cfg.others), self._effective_trace_delay,
+            )
         # Hydrate from persistent store if given. Empty if no prior file or
         # if config fingerprint changed (store handles that itself).
         if stats_store is not None:
@@ -135,32 +176,57 @@ class TraceMatrixTask(BaseTask):
             my_repeater=self.cfg.my_repeater,
             others=list(self.cfg.others),
             cycles=self.cfg.cycles,
-            cycle_interval_sec=self.cfg.cycle_interval,
-            trace_delay_sec=self.cfg.trace_delay,
+            cycle_interval_sec=self._effective_cycle_interval,
+            trace_delay_sec=self._effective_trace_delay,
             timeout_sec=self.cfg.timeout,
         )
 
+        loop = asyncio.get_event_loop()
         try:
             while self.cfg.cycles == 0 or self._cycle < self.cfg.cycles:
                 self._cycle += 1
-                await self._run_cycle(mc, self._cycle)
+                cycle_start = loop.time()
+                await self._run_cycle(mc, self._cycle, cycle_start)
+                # If we share a barrier with sibling trace_matrix tasks, hold
+                # here until they've also finished their cycle. Then summaries
+                # emit in immediate succession, no interleaved trace events.
+                if self._cycle_barrier is not None:
+                    try:
+                        await self._cycle_barrier.wait()
+                    except asyncio.BrokenBarrierError:
+                        # Another task aborted (probably cancelled). Proceed with
+                        # our own summary anyway — best-effort.
+                        logger.debug("cycle barrier broken; emitting own summary anyway")
                 done = self.cfg.cycles != 0 and self._cycle >= self.cfg.cycles
                 await self._emit_summary(self._cycle, final=done)
                 if done:
                     return
-                await safe_sleep(self.cfg.cycle_interval)
+                # Sleep until the NEXT cycle's scheduled start, not "cycle_interval
+                # seconds from now" — keeps cycle-to-cycle cadence regular even if
+                # the cycle itself ran short (all OTHERs responded fast) or long.
+                next_cycle_start = cycle_start + self._effective_cycle_interval
+                await safe_sleep(next_cycle_start - loop.time())
         except asyncio.CancelledError:
-            # Best-effort: print the cumulative table to stdout synchronously.
+            # Sibling waiters on the barrier (if any) are released automatically
+            # — asyncio.Barrier breaks on cancellation of any party's wait().
+            # No abort() needed; calling it without `await` would just leak a
+            # coroutine and cause a RuntimeWarning during shutdown.
+            # Best-effort: print the cumulative table to stderr synchronously.
             # Async sinks are likely shutting down, so we don't try to await them.
             text, _ = _format_table(self.name, self._cycle, final=True,
                                     others=list(self.cfg.others), stats=self._stats)
-            print("\n" + text, file=sys.stderr, flush=True)
+            header = f"\n{self.name} (FINAL cycle {self._cycle})"
+            print(header + "\n" + text, file=sys.stderr, flush=True)
             raise
 
-    async def _run_cycle(self, mc, cycle: int) -> None:
+    async def _run_cycle(self, mc, cycle: int, cycle_start: float) -> None:
+        # Send-to-send cadence: i-th trace is scheduled at cycle_start + i*Δ.
+        # That way the actual response time of a trace (fast success vs slow
+        # timeout) doesn't shift later traces — the rhythm is fixed.
+        loop = asyncio.get_event_loop()
         for i, other in enumerate(self.cfg.others):
-            if i > 0:
-                await safe_sleep(self.cfg.trace_delay)
+            scheduled = cycle_start + i * self._effective_trace_delay
+            await safe_sleep(scheduled - loop.time())
             await self._do_one_trace(mc, cycle, other)
 
     async def _do_one_trace(self, mc, cycle: int, other: str) -> None:
@@ -172,6 +238,12 @@ class TraceMatrixTask(BaseTask):
         send_kwargs = {"auth_code": self.cfg.auth_code, "tag": tag, "path": path}
         if self.cfg.flags is not None:
             send_kwargs["flags"] = self.cfg.flags
+        # Cross-task TX throttle: gate before send_trace so two tasks can't
+        # fire BLE-send commands back-to-back when `bot.cross_task_delay`
+        # is configured. The gate just enforces a minimum gap; wait_for_event
+        # runs without holding any lock.
+        if self._tx_throttle is not None:
+            await self._tx_throttle.gate()
         send = await mc.commands.send_trace(**send_kwargs)
         if send.type == EventType.ERROR:
             self._stats[other].error += 1

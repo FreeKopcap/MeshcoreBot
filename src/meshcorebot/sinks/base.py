@@ -22,8 +22,8 @@ class Record:
     event: str                            # e.g. "trace_data" | "trace_timeout" | "chan_msg_sent"
     task: str                             # task name from config
     device: str                           # bot.device_name
-    ts: str = field(                       # ISO-8601 UTC
-        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ts: str = field(                       # ISO-8601 in the LOCAL timezone
+        default_factory=lambda: datetime.now().astimezone().isoformat(timespec="seconds")
     )
     data: dict[str, Any] = field(default_factory=dict)
 

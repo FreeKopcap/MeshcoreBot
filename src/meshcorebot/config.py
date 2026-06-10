@@ -114,6 +114,13 @@ class BotSettings(BaseModel):
     device_name: str = "meshcorebot"
     reconnect: bool = True
     reconnect_delay: Duration = 10.0
+    # Minimum gap (seconds) between any two trace TX events across all
+    # trace_matrix tasks. Acts as a global throttle before every send_trace
+    # — within-task spacing still comes from `trace_delay`; this kicks in
+    # when two tasks would otherwise fire back-to-back. Default 2s gives the
+    # repeater quiet time between packets without bloating cycles. Set to
+    # null or 0 to disable throttling entirely.
+    cross_task_delay: Duration | None = 2.0
 
 
 # -- Tasks --------------------------------------------------------------------

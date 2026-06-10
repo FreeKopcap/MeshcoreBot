@@ -16,11 +16,12 @@ import logging
 
 from meshcore import EventType
 
-from .config import Config
+from .config import Config, TraceMatrix
 from .sinks.base import Fanout, Record
 from .stats_store import StatsStore
 from .tasks.base import BaseTask, build_task
 from .transport import connect, disconnect
+from .tx_throttle import TxThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +40,24 @@ async def _run_one(task: BaseTask, mc, sinks: Fanout) -> None:
         ))
 
 
-async def supervise(cfg: Config, stats_store: StatsStore | None = None) -> None:
+async def supervise(
+    cfg: Config,
+    stats_store: StatsStore | None = None,
+) -> None:
     """Main bot loop. Returns on KeyboardInterrupt/cancellation.
 
     ``stats_store`` is shared across reconnects so trace_matrix tasks resume
     their cumulative counters instead of restarting at zero on every BLE
-    re-link. The store is created once by the caller (``__main__.cli``), so
-    its in-memory cache + disk-backed JSON files persist across the whole
-    run; a single fingerprint-mismatch auto-invalidates a stale file."""
+    re-link. Cross-task TX throttling (``bot.cross_task_delay``) is wired
+    here too — one ``TxThrottle`` per supervise, passed to every
+    ``trace_matrix`` task so back-to-back BLE-send events are paced."""
     sinks = __import__("meshcorebot.sinks", fromlist=["build_sinks"]).build_sinks(cfg.sinks)
     if stats_store is None:
         stats_store = StatsStore()
+    tx_throttle = TxThrottle(cfg.bot.cross_task_delay) if cfg.bot.cross_task_delay else None
+    if tx_throttle is not None:
+        logger.info("cross-task TX throttle active: min %.1fs between any two send_trace calls",
+                    tx_throttle.min_gap)
     await sinks.start()
     try:
         while True:
@@ -75,13 +83,20 @@ async def supervise(cfg: Config, stats_store: StatsStore | None = None) -> None:
                 except Exception as e:  # noqa: BLE001
                     logger.warning("could not subscribe to DISCONNECTED (%s) — disconnect detection degraded", e)
 
-                # Build task implementations
+                # Build task implementations.
+                # Cycle barrier only useful when 2+ trace_matrix tasks run together —
+                # syncs their end-of-cycle so summaries print one-after-another
+                # without intervening trace events.
+                n_trace_matrix = sum(1 for t in cfg.tasks
+                                     if isinstance(t, TraceMatrix) and getattr(t, "enabled", True))
+                cycle_barrier = asyncio.Barrier(n_trace_matrix) if n_trace_matrix >= 2 else None
                 impls: list[BaseTask] = []
                 for t in cfg.tasks:
                     if not getattr(t, "enabled", True):
                         continue
                     impls.append(build_task(t, cfg.bot.device_name, sinks,
-                                            stats_store=stats_store))
+                                            stats_store=stats_store, tx_throttle=tx_throttle,
+                                            cycle_barrier=cycle_barrier))
 
                 if not impls:
                     await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
