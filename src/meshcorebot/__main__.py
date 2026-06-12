@@ -27,11 +27,63 @@ from .config import load_config
 
 # Stacktrace dumper for debugging hangs. Send `kill -USR1 <PID>` from another
 # terminal and Python writes every thread's stack to stderr — bot keeps
-# running, purely diagnostic. On macOS/Linux only.
+# running, purely diagnostic. On macOS/Linux only. USR1 only shows OS-thread
+# stacks; in asyncio that's usually just the event loop idle in select(), so
+# pair with USR2 below for the coroutine-level picture.
 try:
     faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 except (AttributeError, ValueError):
     pass
+
+
+def _walk_coro_chain(coro):
+    """Yield each frame in the awaited coroutine chain — outermost first.
+
+    asyncio.Task.print_stack() only emits the top-level coroutine's frame,
+    so for `await task.run(mc)` we'd see _run_one but not what's inside.
+    cr_await chains the coroutines together; we walk it manually.
+    """
+    seen = set()
+    while coro is not None and id(coro) not in seen:
+        seen.add(id(coro))
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+        if frame is not None:
+            yield frame
+        inner = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+        # Only recurse into another coroutine/generator (skip Futures etc.).
+        if inner is None or not (hasattr(inner, "cr_frame") or hasattr(inner, "gi_frame")):
+            break
+        coro = inner
+
+
+def _dump_asyncio_tasks() -> None:
+    """Print every live asyncio task and walk into nested awaits. Wired to
+    SIGUSR2 inside `_runner` so it runs on the event loop thread."""
+    import linecache
+    print("\n=== asyncio tasks ===", file=sys.stderr, flush=True)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        print("  (no running event loop)", file=sys.stderr)
+        return
+    tasks = asyncio.all_tasks(loop)
+    print(f"  {len(tasks)} task(s) alive", file=sys.stderr)
+    for t in tasks:
+        state = "done" if t.done() else ("cancelling" if t.cancelling() else "pending")
+        print(f"\n--- task: {t.get_name()!r}  ({state}) ---", file=sys.stderr)
+        frames = list(_walk_coro_chain(t.get_coro()))
+        if not frames:
+            print("  (no frames)", file=sys.stderr)
+            continue
+        for f in frames:
+            fname = f.f_code.co_filename
+            lineno = f.f_lineno
+            func = f.f_code.co_name
+            line = linecache.getline(fname, lineno).strip()
+            print(f"  {fname}:{lineno}  in {func}", file=sys.stderr)
+            if line:
+                print(f"    {line}", file=sys.stderr)
+    print("=== end asyncio tasks ===\n", file=sys.stderr, flush=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -196,6 +248,12 @@ def cli() -> None:
         try:
             loop.add_signal_handler(signal.SIGTERM, stop.set)
         except NotImplementedError:  # windows
+            pass
+        # SIGUSR2 → coroutine-aware stack dump. Runs on the event loop thread
+        # (unlike faulthandler's USR1) so asyncio.all_tasks() works correctly.
+        try:
+            loop.add_signal_handler(signal.SIGUSR2, _dump_asyncio_tasks)
+        except (NotImplementedError, AttributeError):
             pass
 
         run_task = asyncio.create_task(

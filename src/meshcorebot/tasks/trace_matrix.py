@@ -72,8 +72,10 @@ def _format_table(task_name: str, cycle: int, final: bool, others: list[str],
     sep_inner = "-" * width
     # No title here — the console sink renders a compact "[ts] task (cycle N)"
     # header line for trace_cycle_summary; jsonl/mqtt have cycle+final fields
-    # in the structured payload.
+    # in the structured payload. Closing `===` line after the rows so two
+    # adjacent summaries don't visually run together.
     lines = [sep_outer, header, sep_inner]
+    closing = sep_outer
     rows: list[dict] = []
     for o in others:
         s = stats[o]
@@ -90,6 +92,7 @@ def _format_table(task_name: str, cycle: int, final: bool, others: list[str],
             "error": s.error,
             "attempts": s.attempts,
         })
+    lines.append(closing)
     return "\n".join(lines), rows
 
 
@@ -102,9 +105,15 @@ def _config_fingerprint(cfg: TraceMatrix) -> str:
 class TraceMatrixTask(BaseTask):
     cfg: TraceMatrix
 
+    # Hard cap on the BLE write_gatt_char roundtrip. CoreBluetooth on macOS
+    # can hang this `await future` forever when the system suspended BLE
+    # (lid closed, etc.) and the lib has no internal timeout for it.
+    BLE_WRITE_TIMEOUT_SEC = 10.0
+
     def __init__(self, cfg, device_name, sinks, stats_store: "StatsStore | None" = None,
                  tx_throttle: "TxThrottle | None" = None,
-                 cycle_barrier: "asyncio.Barrier | None" = None) -> None:
+                 cycle_barrier: "asyncio.Barrier | None" = None,
+                 force_reconnect=None) -> None:
         super().__init__(cfg, device_name, sinks)
         self._stats_store = stats_store
         self._tx_throttle = tx_throttle
@@ -112,6 +121,11 @@ class TraceMatrixTask(BaseTask):
         # them at end-of-cycle so their summaries print back-to-back instead
         # of being interleaved with the slower task's last-trace events.
         self._cycle_barrier = cycle_barrier
+        # Callable (no args) the task fires when it concludes BLE is dead —
+        # supervise wires it to `disconnect_event.set` so the next cycle of
+        # the reconnect loop runs. Without this the bot just hangs forever
+        # waiting on a BLE write that will never complete.
+        self._force_reconnect = force_reconnect
         self._stats: dict[str, _Stats] = {o: _Stats() for o in cfg.others}
         self._cycle: int = 0
 
@@ -213,9 +227,11 @@ class TraceMatrixTask(BaseTask):
             # coroutine and cause a RuntimeWarning during shutdown.
             # Best-effort: print the cumulative table to stderr synchronously.
             # Async sinks are likely shutting down, so we don't try to await them.
+            from datetime import datetime
             text, _ = _format_table(self.name, self._cycle, final=True,
                                     others=list(self.cfg.others), stats=self._stats)
-            header = f"\n{self.name} (FINAL cycle {self._cycle})"
+            ts = datetime.now().strftime("%H:%M:%S")
+            header = f"\n[{ts}] {self.name} (FINAL cycle {self._cycle})"
             print(header + "\n" + text, file=sys.stderr, flush=True)
             raise
 
@@ -244,7 +260,31 @@ class TraceMatrixTask(BaseTask):
         # runs without holding any lock.
         if self._tx_throttle is not None:
             await self._tx_throttle.gate()
-        send = await mc.commands.send_trace(**send_kwargs)
+        try:
+            # Defensive timeout on send_trace itself — on macOS BLE write can
+            # hang forever after system suspend/resume because CoreBluetooth's
+            # write `await future` never gets signalled. Without this cap the
+            # whole bot would hang and only Ctrl-C could rescue it.
+            send = await asyncio.wait_for(
+                mc.commands.send_trace(**send_kwargs),
+                timeout=self.BLE_WRITE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            self._stats[other].error += 1
+            await self.emit(
+                "trace_send_error", cycle=cycle, other=other, path=path,
+                tag=tag, error="ble_write_timeout",
+            )
+            if self._force_reconnect is not None:
+                logger.warning(
+                    "BLE write_gatt_char to companion hung > %.0fs — forcing reconnect",
+                    self.BLE_WRITE_TIMEOUT_SEC,
+                )
+                try:
+                    self._force_reconnect()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("force_reconnect callback raised: %s", e)
+            return
         if send.type == EventType.ERROR:
             self._stats[other].error += 1
             await self.emit(
@@ -259,11 +299,20 @@ class TraceMatrixTask(BaseTask):
             tag=tag, est_timeout_ms=est_timeout_ms,
         )
 
+        # Defensive timeout: meshcore lib's wait_for_event takes its own
+        # `timeout=` but in practice doesn't always fire it when the BLE
+        # transport drops silently (the lib's event queue just stays empty
+        # forever). Wrap with asyncio.wait_for so OUR timeout is always
+        # enforced — extra +2s buffer over cfg.timeout so the lib's normal
+        # timeout path is preferred when it works.
         try:
-            ev = await mc.wait_for_event(
-                EventType.TRACE_DATA,
-                attribute_filters={"tag": tag},
-                timeout=self.cfg.timeout,
+            ev = await asyncio.wait_for(
+                mc.wait_for_event(
+                    EventType.TRACE_DATA,
+                    attribute_filters={"tag": tag},
+                    timeout=self.cfg.timeout,
+                ),
+                timeout=self.cfg.timeout + 2.0,
             )
         except asyncio.TimeoutError:
             ev = None

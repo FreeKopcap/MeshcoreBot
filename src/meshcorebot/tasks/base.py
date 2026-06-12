@@ -43,14 +43,16 @@ def build_task(
     stats_store: "StatsStore | None" = None,
     tx_throttle: "TxThrottle | None" = None,
     cycle_barrier: "asyncio.Barrier | None" = None,
+    force_reconnect=None,
 ) -> BaseTask:
     """Map a config task variant to its implementation.
 
-    ``stats_store``, ``tx_throttle``, and ``cycle_barrier`` are only consumed
-    by ``trace_matrix``; other task types ignore them. ``cycle_barrier`` is
-    shared across all enabled trace_matrix tasks so their end-of-cycle
-    summaries print back-to-back without interleaved trace events from a
-    slower sibling.
+    Optional kwargs (``stats_store``, ``tx_throttle``, ``cycle_barrier``,
+    ``force_reconnect``) are only consumed by ``trace_matrix``; other types
+    ignore them. ``force_reconnect`` is a no-arg callable the task fires when
+    it concludes BLE is wedged (e.g. send_trace timed out past
+    ``BLE_WRITE_TIMEOUT_SEC``) — supervise wires it to the disconnect event so
+    the reconnect loop kicks in.
     """
     from .chan_msg import ChanMsgTask
     from .trace_loop import TraceLoopTask
@@ -63,7 +65,8 @@ def build_task(
     if isinstance(cfg, TraceMatrix):
         return TraceMatrixTask(cfg, device_name, sinks,
                                stats_store=stats_store, tx_throttle=tx_throttle,
-                               cycle_barrier=cycle_barrier)
+                               cycle_barrier=cycle_barrier,
+                               force_reconnect=force_reconnect)
     raise TypeError(f"unknown task type: {type(cfg).__name__}")
 
 

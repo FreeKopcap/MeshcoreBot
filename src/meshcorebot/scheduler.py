@@ -90,13 +90,19 @@ async def supervise(
                 n_trace_matrix = sum(1 for t in cfg.tasks
                                      if isinstance(t, TraceMatrix) and getattr(t, "enabled", True))
                 cycle_barrier = asyncio.Barrier(n_trace_matrix) if n_trace_matrix >= 2 else None
+                # `force_reconnect` is the task-side hook to kick the supervisor
+                # out of its current connection when BLE is observed to be wedged
+                # (e.g. write_gatt_char hanging past BLE_WRITE_TIMEOUT_SEC).
+                # Setting `disconnected` makes the asyncio.wait below return,
+                # which cascades into the tear-down → reconnect path.
                 impls: list[BaseTask] = []
                 for t in cfg.tasks:
                     if not getattr(t, "enabled", True):
                         continue
                     impls.append(build_task(t, cfg.bot.device_name, sinks,
                                             stats_store=stats_store, tx_throttle=tx_throttle,
-                                            cycle_barrier=cycle_barrier))
+                                            cycle_barrier=cycle_barrier,
+                                            force_reconnect=disconnected.set))
 
                 if not impls:
                     await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
