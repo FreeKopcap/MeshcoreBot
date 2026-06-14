@@ -59,6 +59,12 @@ async def supervise(
         logger.info("cross-task TX throttle active: min %.1fs between any two send_trace calls",
                     tx_throttle.min_gap)
     await sinks.start()
+    # Track consecutive connect failures so we can back off rather than
+    # hammer the scan loop every reconnect_delay seconds. Reset on success.
+    consec_failures = 0
+    MAX_BACKOFF_SEC = 300.0
+    BACKOFF_HINT_AFTER = 3       # log a one-time hint about manual BT recovery
+    backoff_hint_logged = False
     try:
         while True:
             mc = None
@@ -68,6 +74,9 @@ async def supervise(
                 await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
                                           data={"state": "connecting"}))
                 mc = await connect(cfg.transport)
+                # Success — reset backoff machinery.
+                consec_failures = 0
+                backoff_hint_logged = False
                 await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
                                           data={"state": "connected"}))
 
@@ -164,10 +173,22 @@ async def supervise(
                                               data={"state": "all_tasks_finished"}))
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # noqa: BLE001 — surface anything as an event
+            except ConnectionError as e:
+                # Expected during BT-stack-not-ready windows after macOS
+                # sleep/resume. Single-line log, no traceback — and we'll
+                # back off below to stop hammering the scan.
+                consec_failures += 1
+                logger.warning("connect failed (attempt %d): %s", consec_failures, e)
+                await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
+                                          data={"state": "connect_failed",
+                                                "error": str(e),
+                                                "attempt": consec_failures}))
+            except Exception as e:  # noqa: BLE001 — surface anything else as an event
+                consec_failures += 1
                 logger.exception("supervisor error")
                 await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
-                                          data={"state": "error", "error": repr(e)}))
+                                          data={"state": "error", "error": repr(e),
+                                                "attempt": consec_failures}))
             finally:
                 if disconnect_sub is not None and mc is not None:
                     try:
@@ -178,8 +199,25 @@ async def supervise(
 
             if not cfg.bot.reconnect:
                 return
+            # Exponential backoff after consecutive failures. Doubles each time
+            # capped at MAX_BACKOFF_SEC (5 min). Successful connect resets.
+            if consec_failures > 0:
+                backoff = cfg.bot.reconnect_delay * (2 ** (consec_failures - 1))
+                backoff = min(backoff, MAX_BACKOFF_SEC)
+            else:
+                backoff = cfg.bot.reconnect_delay
+            if consec_failures >= BACKOFF_HINT_AFTER and not backoff_hint_logged:
+                backoff_hint_logged = True
+                logger.warning(
+                    "BLE scan has returned 0 devices %d times in a row — macOS Bluetooth "
+                    "stack may not have woken from sleep. Try: toggle Bluetooth in System "
+                    "Settings, or `sudo killall bluetoothd`.",
+                    consec_failures,
+                )
             await sinks.write(Record(event="status", task="-", device=cfg.bot.device_name,
-                                      data={"state": "reconnecting", "delay_sec": cfg.bot.reconnect_delay}))
-            await asyncio.sleep(cfg.bot.reconnect_delay)
+                                      data={"state": "reconnecting",
+                                            "delay_sec": backoff,
+                                            "consec_failures": consec_failures}))
+            await asyncio.sleep(backoff)
     finally:
         await sinks.stop()
