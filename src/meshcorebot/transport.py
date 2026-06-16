@@ -75,9 +75,9 @@ async def _scan_meshcore(timeout: float) -> list[tuple]:
     Uses bleak directly (instead of meshcore's `find_device_by_filter` which
     stops at the first match) so we can present all options. ``scanning_mode``
     is forced to ``"active"`` so we also pick up Scan Response packets — that's
-    where friendly long names like "MeshCore-Kopcap 1️⃣1️⃣4️⃣" arrive (the
-    AD packet carries only a short MAC-suffix name like "MeshCore-D66288DD").
-    When several names show up for the same address, we keep the longest one,
+    where the friendly long names typically arrive (the AD packet usually
+    carries only a short MAC-suffix name like "MeshCore-XXXXXXXX"). When
+    several names show up for the same address, we keep the longest one,
     which is usually the friendly variant.
     """
     from bleak import BleakScanner  # local import — only needed if BLE is in use

@@ -56,7 +56,7 @@ class BleTransport(BaseModel):
     # directly with no scan. Set this OR `name`, not both.
     address: str | None = None
     # Substring match (case-insensitive) against the device's local_name. Useful
-    # when several MeshCore-* nodes are in range. Example: "Kopcap V4".
+    # when several MeshCore-* nodes are in range. Example: "MyNode".
     # When None AND multiple MeshCore-* found, the bot will scan and prompt
     # interactively (if stdin is a TTY) or use the first match (if not).
     name: str | None = None
