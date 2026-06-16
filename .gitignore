@@ -11,5 +11,8 @@ dist/
 logs/
 *.jsonl
 
+# personal per-target trace configs (root-level only; examples/*.yaml is tracked)
+/meshcorebot.*.yaml
+
 # macos
 .DS_Store
