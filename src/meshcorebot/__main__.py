@@ -261,14 +261,31 @@ def cli() -> None:
             name="meshcorebot.supervise",
         )
         stop_task = asyncio.create_task(stop.wait(), name="meshcorebot.stop")
-        done, pending = await asyncio.wait(
-            {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending:
-            t.cancel()
-        for t in done:
-            if t is run_task and t.exception() is not None:
-                raise t.exception()  # type: ignore[misc]
+        try:
+            done, pending = await asyncio.wait(
+                {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            for t in done:
+                if t is run_task and t.exception() is not None:
+                    raise t.exception()  # type: ignore[misc]
+        finally:
+            # If KeyboardInterrupt or any other BaseException ripped through
+            # asyncio.wait, the tasks might be finished with an unretrieved
+            # exception — asyncio logs an ugly "Task exception was never
+            # retrieved" warning during interpreter shutdown. Calling
+            # .exception() on each done task formally retrieves the value
+            # and silences the warning. Cancel any still-pending task too.
+            for t in (run_task, stop_task):
+                if t.done():
+                    if not t.cancelled():
+                        try:
+                            t.exception()
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
+                else:
+                    t.cancel()
 
     try:
         asyncio.run(_runner())
